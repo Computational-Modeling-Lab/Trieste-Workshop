@@ -116,6 +116,7 @@ def main():
         imgsz=args.imgsz,
         batch=args.batch,
         device="cpu",
+        save=True,
         save_txt=True,
         save_json=True
     )
