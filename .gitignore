@@ -1,0 +1,3 @@
+runs/*
+subset_test_*.txt
+subset_data_*.yaml
