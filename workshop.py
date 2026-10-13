@@ -2,6 +2,7 @@
 from ultralytics import YOLO
 from pathlib import Path
 import argparse
+import random
 import yaml
 
 # Define supported image extensions for filtering
@@ -31,7 +32,6 @@ def get_test_images_list(root: Path, data: dict, split_key: str = "test") -> lis
 
     split_raw = Path(split_value).expanduser()
     split_path = split_raw if split_raw.is_absolute() else (root / split_raw).resolve()
-
     # If split is a directory (e.g. test or test/images)
     if split_path.is_dir():
         # If directory has no images directly but has an "images" subfolder, use it
@@ -41,9 +41,7 @@ def get_test_images_list(root: Path, data: dict, split_key: str = "test") -> lis
         if len(imgs) == 0 and (split_path / "images").is_dir():
             candidate = split_path / "images"
             imgs = [p for p in candidate.rglob("*") if p.is_file() and p.suffix.lower() in IMG_EXTS]
-
         return sorted(imgs, key=lambda p: p.name.lower())
-
     # If split is a txt file with image paths
     if split_path.is_file() and split_path.suffix.lower() == ".txt":
         lines = [ln.strip() for ln in split_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
@@ -54,22 +52,23 @@ def get_test_images_list(root: Path, data: dict, split_key: str = "test") -> lis
                 p = (root / p).resolve()
             imgs.append(p)
         return sorted(imgs, key=lambda p: p.name.lower())
-
     raise ValueError(f"Test split path is neither a directory nor a .txt list: {split_path}")
-
 
 # Main function to execute the validation workflow
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n", type=int, default=-1,
-                        help="How many test images to evaluate (first N sorted by filename). Use -1 for ALL.")
+                        help="How many test images to evaluate. Use -1 for ALL.")
+    parser.add_argument("--random", action="store_true",
+                        help="Use reproducible random sampling instead of sorted sampling")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed, only used when --random is enabled")
     parser.add_argument("--data", type=str, default="data.yaml", help="Path to data.yaml")
     parser.add_argument("--weights", type=str, default="best.pt", help="Path to trained weights")
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--device", type=str, default="0", help='e.g. "0" or "cpu"')
     args = parser.parse_args()
-
     # Load data.yaml and resolve dataset root
     data_yaml_path = Path(args.data).expanduser().resolve()
     data = load_data_yaml(data_yaml_path)
@@ -77,12 +76,17 @@ def main():
     print("data.yaml:", data_yaml_path)
     print("dataset root resolved:", root)
     print("data['test']:", data.get("test"))
-    
-    
-    # Collect & sort test images
-    test_imgs = get_test_images_list(root, data, split_key="test")
 
-    # Take first N (if requested)
+    # The helper always returns an alphabetically sorted list.
+    test_imgs = get_test_images_list(root, data, split_key="test")
+    if args.random:
+        rng = random.Random(args.seed)
+        rng.shuffle(test_imgs)
+        print(f"Sampling mode: RANDOM (seed={args.seed})")
+    else:
+        print("Sampling mode: SORTED")
+
+    # Take first N (if requested) from the selected order
     if args.n is not None and args.n > 0:
         test_imgs = test_imgs[:args.n]
 
@@ -90,37 +94,41 @@ def main():
     if len(test_imgs) == 0:
         raise SystemExit("No test images found for the given configuration.")
 
-    # Write subset list file
-    subset_list_path = data_yaml_path.parent / f"subset_test_{len(test_imgs)}.txt"
-    subset_list_path.write_text("\n".join(str(p) for p in test_imgs) + "\n", encoding="utf-8")
+    # Preserve the old filenames for sorted mode and avoid collisions in random mode.
+    tag = (f"{len(test_imgs)}_random_seed{args.seed}"
+           if args.random else f"{len(test_imgs)}")
 
+    # Write subset list file
+    subset_list_path = data_yaml_path.parent / f"subset_test_{tag}.txt"
+    subset_list_path.write_text("\n".join(str(p) for p in test_imgs) + "\n", encoding="utf-8")
     # Create a modified data.yaml for this subset
     data_subset = dict(data)
     data_subset["test"] = str(subset_list_path)
 
     # Write a temporary yaml file for this subset
-    subset_yaml_path = data_yaml_path.parent / f"subset_data_{len(test_imgs)}.yaml"
+    subset_yaml_path = data_yaml_path.parent / f"subset_data_{tag}.yaml"
     subset_yaml_path.write_text(
         yaml.safe_dump(data_subset, sort_keys=False),
         encoding="utf-8"
     )
 
     print("Using subset yaml:", subset_yaml_path)
-
     # Run validation with the subset yaml
     model = YOLO(args.weights)
-    
+
     results = model.val(
-        data=str(subset_yaml_path),  
+        data=str(subset_yaml_path),
         split="test",
         imgsz=args.imgsz,
         batch=args.batch,
         device="cpu",
         save=True,
         save_txt=True,
-        save_json=True
+        save_json=True,
+        project="runs/detect",
+        name=f"val_{tag}",
+        exist_ok=True,
     )
-
     # Print validation metrics
     print("Validation Metrics (subset):")
     print(f"Images evaluated: {len(test_imgs)}")
